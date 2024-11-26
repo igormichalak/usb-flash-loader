@@ -95,9 +95,9 @@ void __not_in_flash_func(flash_wait_done)(spi_inst_t *spi, uint cs_pin) {
 	} while (status & FLASH_STATUS_BUSY_MASK);
 }
 
-void __not_in_flash_func(flash_sector_erase)(spi_inst_t *spi, uint cs_pin, uint32_t addr) {
+void __not_in_flash_func(flash_erase)(spi_inst_t *spi, uint cs_pin, uint8_t erase_cmd, uint32_t addr) {
 	uint8_t cmdbuf[4] = {
-		FLASH_CMD_ERASE_4K_SECTOR,
+		cmd,
 		addr >> 16,
 		addr >> 8,
 		addr
