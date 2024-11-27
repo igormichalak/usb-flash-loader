@@ -92,8 +92,8 @@ void __not_in_flash_func(flash_unlock)(spi_inst_t *spi) {
 	spi_write_blocking(spi, cmdbuf, 2);
 }
 
-void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint32_t addr, uint8_t *buf, size_t len) {
-	uint8_t *cmdbuf = (uint8_t[]){
+void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint cs_pin, uint32_t addr, uint8_t *buf, size_t len) {
+	uint8_t cmdbuf[4] = {
 		FLASH_CMD_READ,
 		addr >> 16,
 		addr >> 8,
@@ -107,12 +107,15 @@ void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint32_t addr, uint8_t *bu
 	size_t rx_cmd_remaining = 4;
 	size_t rx_data_remaining = len;
 
+	gpio_set_function(cs_pin, GPIO_FUNC_SIO);
+	asm volatile("nop \n nop \n nop");
+
 	while (tx_cmd_remaining || tx_data_remaining || rx_cmd_remaining || rx_data_remaining) {
 		size_t tx_remaining = tx_cmd_remaining + tx_data_remaining;
 		size_t rx_remaining = rx_cmd_remaining + rx_data_remaining;
 		if (spi_is_writable(spi) && rx_remaining < tx_remaining + fifo_depth) {
 			if (tx_cmd_remaining) {
-				spi_get_hw(spi)->dr = (uint32_t) *cmdbuf++;
+				spi_get_hw(spi)->dr = (uint32_t) cmdbuf[4 - tx_cmd_remaining];
 				--tx_cmd_remaining;
 			} else if (tx_data_remaining) {
 				spi_get_hw(spi)->dr = (uint32_t) repeated_tx_data;
@@ -129,6 +132,10 @@ void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint32_t addr, uint8_t *bu
 			}
 		}
 	}
+
+	while (spi_get_hw(spi)->sr & SPI_SSPSR_BSY_BITS);
+	asm volatile("nop \n nop \n nop");
+	gpio_set_function(cs_pin, GPIO_FUNC_SPI);
 }
 
 void __not_in_flash_func(flash_erase)(spi_inst_t *spi, uint8_t erase_cmd, uint32_t addr) {
@@ -200,14 +207,37 @@ void core1_entry() {
 	gpio_set_dir(SPI_CSN_PIN, GPIO_OUT);
 	gpio_put(SPI_CSN_PIN, 0);
 
-	spi_init(spi0, 25 * 1000 * 1000);
+	spi_init(spi0, 50 * 1000);
 	spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 	gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_TX_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_RX_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_CSN_PIN, GPIO_FUNC_SPI);
 
-	while (true) {}
+	flash_unlock(spi0);
+	flash_erase(spi0, FLASH_CMD_ERASE_4K_SECTOR, 0);
+
+	uint8_t data[256];
+
+	for (size_t i = 0; i < sizeof(data); i++) {
+		data[i] = 255 - i;
+	}
+
+	flash_aai_write(spi0, SPI_CSN_PIN, SPI_RX_PIN, 0, data, sizeof(data));
+
+	memset(data, 0, sizeof(data));
+
+	while (true) {
+		flash_read(spi0, SPI_CSN_PIN, 0, data, sizeof(data));
+
+		for (size_t i = 0; i < sizeof(data); i++) {
+			printf("%03" PRIu8 " ", data[i]);
+			if ((i + 1) % 8 == 0) printf("\n");
+		}
+		printf("\n");
+
+		sleep_ms(1000);
+	}
 }
 
 int main() {
