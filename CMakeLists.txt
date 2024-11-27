@@ -17,4 +17,4 @@ pico_enable_stdio_uart(firmware 0)
 
 pico_add_extra_outputs(firmware)
 
-target_link_libraries(firmware pico_stdlib pico_multicore hardware_spi)
+target_link_libraries(firmware pico_stdlib pico_multicore hardware_gpio hardware_spi)
