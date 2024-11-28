@@ -1,11 +1,16 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <stdatomic.h>
+#include <string.h>
 #include <inttypes.h>
+#include <stdatomic.h>
+
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/spi.h"
+#include "bsp/board_api.h"
+#include "tusb.h"
 
 #define SPI_SCK_PIN	18
 #define SPI_TX_PIN	19
@@ -31,6 +36,8 @@
 #define BUFFER_SECTION_SIZE (64 * 1024)
 #define BUFFER_SECTIONS 4
 #define BUFFER_SIZE (BUFFER_SECTION_SIZE * BUFFER_SECTIONS)
+
+static void cdc_task(void);
 
 static volatile uint8_t __aligned(4) __uninitialized_ram(buffer)[BUFFER_SIZE];
 static _Atomic uint32_t __aligned(4) section_locks = 0;
@@ -97,7 +104,7 @@ void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint cs_pin, uint32_t addr
 		FLASH_CMD_READ,
 		addr >> 16,
 		addr >> 8,
-		addr
+		addr,
 	};
 
 	const size_t fifo_depth = 8;
@@ -143,7 +150,7 @@ void __not_in_flash_func(flash_erase)(spi_inst_t *spi, uint8_t erase_cmd, uint32
 		erase_cmd,
 		addr >> 16,
 		addr >> 8,
-		addr
+		addr,
 	};
 	flash_write_enable(spi);
 	spi_write_blocking(spi, cmdbuf, sizeof(cmdbuf));
@@ -156,7 +163,7 @@ void __not_in_flash_func(flash_byte_write)(spi_inst_t *spi, uint32_t addr, uint8
 		addr >> 16,
 		addr >> 8,
 		addr,
-		data
+		data,
 	};
 	flash_write_enable(spi);
 	spi_write_blocking(spi, cmdbuf, sizeof(cmdbuf));
@@ -177,7 +184,7 @@ void __not_in_flash_func(flash_aai_write)(spi_inst_t *spi, uint cs_pin, uint rx_
 		addr >> 8,
 		addr,
 		byte_0,
-		byte_1
+		byte_1,
 	};
 	spi_write_blocking(spi, cmdbuf, sizeof(cmdbuf));
 
@@ -189,7 +196,7 @@ void __not_in_flash_func(flash_aai_write)(spi_inst_t *spi, uint cs_pin, uint rx_
 		uint8_t aai_cmdbuf[3] = {
 			FLASH_CMD_AAI_PROGRAM,
 			byte_0,
-			byte_1
+			byte_1,
 		};
 		spi_write_blocking(spi, aai_cmdbuf, sizeof(aai_cmdbuf));
 	}
@@ -207,7 +214,7 @@ void core1_entry() {
 	gpio_set_dir(SPI_CSN_PIN, GPIO_OUT);
 	gpio_put(SPI_CSN_PIN, 0);
 
-	spi_init(spi0, 50 * 1000);
+	spi_init(spi0, 1000 * 1000);
 	spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 	gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_TX_PIN, GPIO_FUNC_SPI);
@@ -215,38 +222,39 @@ void core1_entry() {
 	gpio_set_function(SPI_CSN_PIN, GPIO_FUNC_SPI);
 
 	flash_unlock(spi0);
-	flash_erase(spi0, FLASH_CMD_ERASE_4K_SECTOR, 0);
-
-	uint8_t data[256];
-
-	for (size_t i = 0; i < sizeof(data); i++) {
-		data[i] = 255 - i;
-	}
-
-	flash_aai_write(spi0, SPI_CSN_PIN, SPI_RX_PIN, 0, data, sizeof(data));
-
-	memset(data, 0, sizeof(data));
-
-	while (true) {
-		flash_read(spi0, SPI_CSN_PIN, 0, data, sizeof(data));
-
-		for (size_t i = 0; i < sizeof(data); i++) {
-			printf("%03" PRIu8 " ", data[i]);
-			if ((i + 1) % 8 == 0) printf("\n");
-		}
-		printf("\n");
-
-		sleep_ms(1000);
-	}
-}
-
-int main() {
-	for (int i = 0; i < BUFFER_SECTIONS; ++i) {
-		atomic_store(&section_sizes[i], 0);
-	}
-
-	stdio_init_all();
-	multicore_launch_core1(core1_entry);
 
 	while (true) {}
 }
+
+int main(void) {
+	for (int i = 0; i < BUFFER_SECTIONS; ++i) {
+		atomic_store(&section_sizes[i], 0);
+	}
+	multicore_launch_core1(core1_entry);
+
+	board_init();
+	tusb_rhport_init_t device_init = {
+		.role = TUSB_ROLE_DEVICE,
+		.speed = TUSB_SPEED_AUTO,
+	};
+	tusb_init(BOARD_TUD_RHPORT, &device_init);
+
+	if (board_init_after_tusb) {
+		board_init_after_tusb();
+	}
+
+	while (true) {
+		tud_task();
+		cdc_task();
+	}
+}
+
+void tud_mount_cb(void) {}
+void tud_unmount_cb(void) {}
+
+static void cdc_task(void) {
+	if (!tud_cdc_n_available(0)) {
+		return;
+	}
+}
+
