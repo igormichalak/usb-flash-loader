@@ -13,9 +13,9 @@ const tusb_desc_device_t desc_device = {
 	.bLength			= sizeof(tusb_desc_device_t),
 	.bDescriptorType	= TUSB_DESC_DEVICE,
 	.bcdUSB				= USB_BCD,
-	.bDeviceClass		= TUSB_CLASS_MISC,
-	.bDeviceSubClass	= MISC_SUBCLASS_COMMON,
-	.bDeviceProtocol	= MISC_PROTOCOL_IAD,
+	.bDeviceClass		= TUSB_CLASS_VENDOR_SPECIFIC,
+	.bDeviceSubClass	= 0x00,
+	.bDeviceProtocol	= 0x00,
 	.bMaxPacketSize0	= CFG_TUD_ENDPOINT0_SIZE,
 	.idVendor			= USB_VID,
 	.idProduct			= USB_PID,
@@ -35,36 +35,34 @@ const uint8_t *tud_descriptor_device_cb(void) {
 //-------------------------------------------------------+
 
 enum {
-	ITF_NUM_CDC_0 = 0,
-	ITF_NUM_CDC_0_DATA,
+	ITF_NUM_VENDOR = 0,
 	ITF_NUM_TOTAL,
 };
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_VENDOR_DESC_LEN)
 
-#define EPNUM_CDC_0_NOTIF	0x81
-#define EPNUM_CDC_0_OUT		0x02
-#define EPNUM_CDC_0_IN		0x82
+#define EPNUM_VENDOR_OUT	0x01
+#define EPNUM_VENDOR_IN		0x81
 
 const uint8_t desc_fs_configuration[] = {
 	TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-	TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_0, 4, EPNUM_CDC_0_NOTIF, 8, EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 64),
+	TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, 4, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64),
 };
 
 #if TUD_OPT_HIGH_SPEED
 
 const uint8_t desc_hs_configuration[] = {
 	TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-	TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_0, 4, EPNUM_CDC_0_NOTIF, 8, EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 512),
+	TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, 4, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 512),
 };
 
 const tusb_desc_device_qualifier_t desc_device_qualifier = {
 	.bLength			= sizeof(tusb_desc_device_t),
 	.bDescriptorType	= TUSB_DESC_DEVICE,
 	.bcdUSB				= USB_BCD,
-	.bDeviceClass		= TUSB_CLASS_MISC,
-	.bDeviceSubClass	= MISC_SUBCLASS_COMMON,
-	.bDeviceProtocol	= MISC_PROTOCOL_IAD,
+	.bDeviceClass		= TUSB_CLASS_VENDOR_SPECIFIC,
+	.bDeviceSubClass	= 0x00,
+	.bDeviceProtocol	= 0x00,
 	.bMaxPacketSize0	= CFG_TUD_ENDPOINT0_SIZE,
 	.bNumConfigurations	= 0x01,
 	.bReserved			= 0x00,
@@ -104,10 +102,10 @@ enum {
 
 const char *string_desc_arr[] = {
 	(const char[]){ 0x09, 0x04 },
-	"TinyUSB",
-	"TinyUSB Device",
+	"OSHW",
+	"SPI Flash Programmer",
 	NULL,
-	"TinyUSB CDC",
+	"Vendor Interface",
 };
 
 static uint16_t _desc_str[32+1];

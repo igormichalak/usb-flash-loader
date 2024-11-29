@@ -16,6 +16,7 @@ add_executable(firmware)
 pico_sdk_init()
 pico_enable_stdio_usb(firmware 0)
 pico_enable_stdio_uart(firmware 0)
+pico_enable_stdio_rtt(firmware 1)
 pico_add_extra_outputs(firmware)
 
 target_sources(firmware PUBLIC

@@ -37,8 +37,6 @@
 #define BUFFER_SECTIONS 4
 #define BUFFER_SIZE (BUFFER_SECTION_SIZE * BUFFER_SECTIONS)
 
-static void cdc_task(void);
-
 static volatile uint8_t __aligned(4) __uninitialized_ram(buffer)[BUFFER_SIZE];
 static _Atomic uint32_t __aligned(4) section_locks = 0;
 static _Atomic uint32_t __aligned(4) section_sizes[BUFFER_SECTIONS];
@@ -227,11 +225,6 @@ void core1_entry() {
 }
 
 int main(void) {
-	for (int i = 0; i < BUFFER_SECTIONS; ++i) {
-		atomic_store(&section_sizes[i], 0);
-	}
-	multicore_launch_core1(core1_entry);
-
 	board_init();
 	tusb_rhport_init_t device_init = {
 		.role = TUSB_ROLE_DEVICE,
@@ -243,18 +236,34 @@ int main(void) {
 		board_init_after_tusb();
 	}
 
+	stdio_init_all();
+	for (int i = 0; i < BUFFER_SECTIONS; ++i) {
+		atomic_store(&section_sizes[i], 0);
+	}
+	multicore_launch_core1(core1_entry);
+
 	while (true) {
 		tud_task();
-		cdc_task();
 	}
 }
 
 void tud_mount_cb(void) {}
 void tud_unmount_cb(void) {}
 
-static void cdc_task(void) {
-	if (!tud_cdc_n_available(0)) {
-		return;
-	}
+void tud_suspend_cb(bool remote_wakeup_en) {
+	(void) remote_wakeup_en;
 }
+void tud_resume_cb(void) {}
 
+void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize) {
+	(void) itf;
+
+	for (size_t i = 0; i < bufsize; ++i) {
+		printf("%c", *buffer++);
+	}
+	printf("\n");
+
+#if CFG_TUD_VENDOR_RX_BUFSIZE > 0
+	tud_vendor_read_flush();
+#endif
+}
