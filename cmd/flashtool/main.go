@@ -4,10 +4,121 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/google/gousb"
 )
+
+type AlignedFile struct {
+	Alignment int
+	Path      string
+}
+
+type WriteGroup struct {
+	Offset int
+	Files  []AlignedFile
+}
+
+func matchFlag(s string, flagNames ...string) bool {
+	for _, flagName := range flagNames {
+		singleHyphenFlag := "-" + flagName
+		doubleHyphenFlag := "--" + flagName
+		if s == singleHyphenFlag || s == doubleHyphenFlag {
+			return true
+		}
+	}
+	return false
+}
+
+func parseOffset(s string) (int, error) {
+	var n int64
+	var err error
+	switch true {
+	case strings.HasPrefix(s, "0x"):
+		if utf8.RuneCountInString(s) == 2 {
+			return 0, fmt.Errorf("offset consists only of a hex prefix")
+		}
+		n, err = strconv.ParseInt(s[2:], 16, 64)
+	case strings.HasPrefix(s, "0") && utf8.RuneCountInString(s) > 1:
+		n, err = strconv.ParseInt(s[1:], 8, 64)
+	case strings.HasPrefix(s, "0b"):
+		if utf8.RuneCountInString(s) == 2 {
+			return 0, fmt.Errorf("offset consists only of a binary prefix")
+		}
+		n, err = strconv.ParseInt(s[2:], 2, 64)
+	default:
+		n, err = strconv.ParseInt(s, 10, 64)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse the offset value: %w", err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("offset cannot be negative")
+	}
+	if n > math.MaxInt32 {
+		return 0, fmt.Errorf("offset has to be 32-bit")
+	}
+	return int(n), nil
+}
+
+func parseArgs(args []string) ([]WriteGroup, error) {
+	var groups []WriteGroup
+	var wg *WriteGroup
+	currentAlignment := 1
+
+	for i := 0; i < len(args); i++ {
+		if matchFlag(args[i], "debug", "erase-sector") {
+			i++
+			continue
+		}
+		if matchFlag(args[i], "o", "p2a", "f") && i == len(args)-1 {
+			return nil, fmt.Errorf("no value given for %q", args[i])
+		}
+		switch true {
+		case matchFlag(args[i], "o"):
+			if wg != nil {
+				groups = append(groups, *wg)
+			}
+			offset, err := parseOffset(args[i+1])
+			if err != nil {
+				return nil, err
+			}
+			wg = &WriteGroup{
+				Offset: offset,
+				Files:  make([]AlignedFile, 0),
+			}
+			currentAlignment = 1
+			i++
+		case matchFlag(args[i], "p2a"):
+			if wg == nil {
+				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)")
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("cannot parse %q flag value: %s", args[i], args[i+1])
+			}
+			currentAlignment = 1 << n
+			i++
+		case matchFlag(args[i], "f"):
+			if wg == nil {
+				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)")
+			}
+			wg.Files = append(wg.Files, AlignedFile{
+				Alignment: currentAlignment,
+				Path: args[i+1],
+			})
+			i++
+		}
+	}
+	if wg != nil {
+		groups = append(groups, *wg)
+	}
+	return groups, nil
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -29,6 +140,15 @@ func run() error {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *debug < 0 || *debug > 3 {
+		return fmt.Errorf("debug level out of range (0..3)")
+	}
+
+	_, err := parseArgs(os.Args[1:])
+	if err != nil {
+		return err
+	}
 
 	usbctx := gousb.NewContext()
 	defer usbctx.Close()
