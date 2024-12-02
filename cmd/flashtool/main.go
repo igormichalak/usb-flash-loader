@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -125,6 +128,37 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 	return groups, nil
 }
 
+func isFile(path string) (bool, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		var pathErr *fs.PathError
+		if errors.As(err, &pathErr) {
+			return false, nil
+		} else {
+			return false, err
+		}
+	}
+	return !fi.IsDir(), nil
+}
+
+func verifyFiles(groups []WriteGroup) error {
+	for _, group := range groups {
+		for _, file := range group.Files {
+			if ok, err := isFile(file.Path); err != nil {
+				return err
+			} else if !ok {
+				printPath := file.Path
+				absolutePath, err := filepath.Abs(file.Path)
+				if err == nil {
+					printPath = absolutePath
+				}
+				return fmt.Errorf("%q is not a file", printPath)
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -150,8 +184,11 @@ func run() error {
 		return fmt.Errorf("debug level out of range (0..3)")
 	}
 
-	_, err := parseArgs(os.Args[1:])
+	groups, err := parseArgs(os.Args[1:])
 	if err != nil {
+		return err
+	}
+	if err := verifyFiles(groups); err != nil {
 		return err
 	}
 
