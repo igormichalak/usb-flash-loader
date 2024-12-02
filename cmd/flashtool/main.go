@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -24,14 +25,18 @@ type WriteGroup struct {
 }
 
 func matchFlag(s string, flagNames ...string) bool {
-	for _, flagName := range flagNames {
-		singleHyphenFlag := "-" + flagName
-		doubleHyphenFlag := "--" + flagName
-		if s == singleHyphenFlag || s == doubleHyphenFlag {
-			return true
+	hyphens := 0
+	for _, c := range s {
+		if c == '-' {
+			hyphens++
+		} else {
+			break
 		}
 	}
-	return false
+	if hyphens == 0 || hyphens > 2 {
+		return false
+	}
+	return slices.Contains(flagNames, s[hyphens:])
 }
 
 func parseOffset(s string) (int, error) {
@@ -122,7 +127,7 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error: %v\n", err)
 		fmt.Println("Write failed.")
 		os.Exit(1)
 	}
