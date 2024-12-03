@@ -196,8 +196,18 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 	var chunks []FlashChunk
 	var mappings []FileMapping
 	buf := bytes.NewBuffer(make([]byte, 0, 1024))
+	prevGroupEnd := 0
 	for _, group := range slices.SortedFunc(slices.Values(groups), cmpWriteGroups) {
 		currentMemOffset := group.MemOffset
+
+		if currentMemOffset < prevGroupEnd {
+			return nil, nil, fmt.Errorf(
+				"write group starting at offset %#x overlaps with " +
+				"previous write group ending at %#x",
+				currentMemOffset, prevGroupEnd,
+			)
+		}
+
 		for _, af := range group.Files {
 			pads := (af.Alignment - (currentMemOffset % af.Alignment)) % af.Alignment
 			for i := 0; i < pads; i++ {
@@ -230,6 +240,7 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 			MemSize:   currentMemOffset - group.MemOffset,
 			Data:      data,
 		})
+		prevGroupEnd = currentMemOffset
 	}
 	return chunks, mappings, nil
 }
