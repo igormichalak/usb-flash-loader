@@ -101,7 +101,7 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 		}
 		switch true {
 		case matchFlag(args[i], "o"):
-			if wg != nil {
+			if wg != nil && len(wg.Files) > 0 {
 				groups = append(groups, *wg)
 			}
 			offset, err := parseMemOffset(args[i+1])
@@ -147,9 +147,12 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 			return nil, fmt.Errorf("unrecognized flag: %s", args[i])
 		}
 	}
-	if wg != nil {
+	if wg != nil && len(wg.Files) > 0 {
 		groups = append(groups, *wg)
 	}
+	slices.SortFunc(groups, func(a, b WriteGroup) int {
+		return a.MemOffset - b.MemOffset
+	})
 	return groups, nil
 }
 
@@ -239,9 +242,10 @@ func printFileMappings(mappings []FileMapping) {
 	if highestOffset > 0 {
 		hexDigits = int(math.Ceil(math.Log2(float64(highestOffset)) / 4))
 	}
-	hexFormat := fmt.Sprintf("%%#0%dx", hexDigits)
+	offsetFormat := fmt.Sprintf("%%#0%dx", hexDigits)
 	for _, mapping := range mappings {
-		fmt.Printf(hexFormat+" -> %s\n", mapping.MemOffset, mapping.Path)
+		fmt.Printf(offsetFormat, mapping.MemOffset)
+		fmt.Printf(" <-> %s (%d bytes)\n", mapping.Path, mapping.MemSize)
 	}
 }
 
