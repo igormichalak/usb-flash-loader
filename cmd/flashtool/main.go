@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -23,8 +24,20 @@ type AlignedFile struct {
 }
 
 type WriteGroup struct {
-	Offset int
-	Files  []AlignedFile
+	MemOffset int
+	Files     []AlignedFile
+}
+
+type FlashChunk struct {
+	MemOffset int
+	MemSize   int
+	Data      []byte
+}
+
+type FileMapping struct {
+	Path      string
+	MemOffset int
+	MemSize   int
 }
 
 func matchFlag(s string, flagNames ...string) bool {
@@ -42,7 +55,7 @@ func matchFlag(s string, flagNames ...string) bool {
 	return slices.Contains(flagNames, s[hyphens:])
 }
 
-func parseOffset(s string) (int, error) {
+func parseMemOffset(s string) (int, error) {
 	var n int64
 	var err error
 	switch true {
@@ -91,19 +104,19 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 			if wg != nil {
 				groups = append(groups, *wg)
 			}
-			offset, err := parseOffset(args[i+1])
+			offset, err := parseMemOffset(args[i+1])
 			if err != nil {
 				return nil, err
 			}
 			wg = &WriteGroup{
-				Offset: offset,
-				Files:  make([]AlignedFile, 0),
+				MemOffset: offset,
+				Files:     make([]AlignedFile, 0),
 			}
 			currentAlignment = 1
 			i++
 		case matchFlag(args[i], "p2a"):
 			if wg == nil {
-				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)")
+				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)", args[i])
 			}
 			n, err := strconv.Atoi(args[i+1])
 			if err != nil {
@@ -113,13 +126,15 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 			i++
 		case matchFlag(args[i], "f"):
 			if wg == nil {
-				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)")
+				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)", args[i])
 			}
 			wg.Files = append(wg.Files, AlignedFile{
 				Alignment: currentAlignment,
-				Path: args[i+1],
+				Path:      args[i+1],
 			})
 			i++
+		default:
+			return nil, fmt.Errorf("unrecognized flag: %s", args[i])
 		}
 	}
 	if wg != nil {
@@ -159,6 +174,67 @@ func verifyFiles(groups []WriteGroup) error {
 	return nil
 }
 
+func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, error) {
+	var chunks []FlashChunk
+	var mappings []FileMapping
+	buf := bytes.NewBuffer(make([]byte, 0, 1024))
+	for _, group := range groups {
+		currentMemOffset := group.MemOffset
+		for _, af := range group.Files {
+			pads := (af.Alignment - (currentMemOffset % af.Alignment)) % af.Alignment
+			for i := 0; i < pads; i++ {
+				if err := buf.WriteByte(0); err != nil {
+					return nil, nil, fmt.Errorf("can't pad data: %w", err)
+				}
+			}
+			currentMemOffset += pads
+			f, err := os.Open(af.Path)
+			if err != nil {
+				return nil, nil, fmt.Errorf("can't open a file: %w", err)
+			}
+			n, err := f.WriteTo(buf)
+			f.Close()
+			if err != nil {
+				return nil, nil, fmt.Errorf("can't copy data from file %s to buffer: %w", af.Path, err)
+			}
+			mappings = append(mappings, FileMapping{
+				Path:      af.Path,
+				MemOffset: currentMemOffset,
+				MemSize:   int(n),
+			})
+			currentMemOffset += int(n)
+		}
+		data := make([]byte, buf.Len())
+		copy(data, buf.Bytes())
+		buf.Reset()
+		chunks = append(chunks, FlashChunk{
+			MemOffset: group.MemOffset,
+			MemSize:   currentMemOffset - group.MemOffset,
+			Data:      data,
+		})
+	}
+	slices.SortFunc(mappings, func(a, b FileMapping) int {
+		return a.MemOffset - b.MemOffset
+	})
+	return chunks, mappings, nil
+}
+
+func printFileMappings(mappings []FileMapping) {
+	fmt.Println("File Mappings:")
+	highestOffset := 0
+	for _, mapping := range mappings {
+		highestOffset = max(highestOffset, mapping.MemOffset)
+	}
+	hexDigits := 1
+	if highestOffset > 0 {
+		hexDigits = int(math.Ceil(math.Log2(float64(highestOffset)) / 4))
+	}
+	hexFormat := fmt.Sprintf("%%#0%dx", hexDigits)
+	for _, mapping := range mappings {
+		fmt.Printf(hexFormat+" -> %s\n", mapping.MemOffset, mapping.Path)
+	}
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -190,6 +266,14 @@ func run() error {
 	}
 	if err := verifyFiles(groups); err != nil {
 		return err
+	}
+	_, mappings, err := generateFlashChunks(groups)
+	if err != nil {
+		return err
+	}
+
+	if len(mappings) > 0 {
+		printFileMappings(mappings)
 	}
 
 	usbctx := gousb.NewContext()
@@ -238,7 +322,7 @@ func run() error {
 		} else if buf[0] == 0x00 {
 			respC <- nil
 		} else {
-			respC <- fmt.Errorf("unrecognized error (%#02X)", buf[0])
+			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
 		}
 	}()
 
