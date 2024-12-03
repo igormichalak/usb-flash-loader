@@ -74,6 +74,18 @@ func parseMemSize(s string) (int, error) {
 	return n * multiplier, nil
 }
 
+func parseEraseBlocks(s string) ([]int, error) {
+	var sizes []int
+	for _, memSize := range strings.Split(s, ",") {
+		n, err := parseMemSize(memSize)
+		if err != nil {
+			return nil, err
+		}
+		sizes = append(sizes, n)
+	}
+	return sizes, nil
+}
+
 func matchFlag(s string, flagNames ...string) bool {
 	hyphens := 0
 	for _, c := range s {
@@ -299,7 +311,7 @@ func main() {
 
 func run() error {
 	debug := flag.Int("debug", 0, "libusb debug level (0..3)")
-	eraseSector := flag.String("erase-sector", "", "smallest erase sector (e.g. 2048, 4K, 1M)")
+	eraseBlocks := flag.String("erase-blocks", "4K,32K,64K", "erase block size list (e.g. 2048,4K,1M)")
 	_ = flag.String("o", "", "offset (hex: 0x, octal: 0, binary: 0b or decimal literal)")
 	_ = flag.Int("a", 0, "alignment (pad with 0s up to a multiple of N)")
 	_ = flag.Int("p2a", 0, "power of two alignment (pad with 0s up to a multiple of 2^N)")
@@ -314,19 +326,14 @@ func run() error {
 		return fmt.Errorf("debug level out of range (0..3)")
 	}
 
-	eraseSectorBytes := 1
-	if *eraseSector != "" {
-		n, err := parseMemSize(*eraseSector)
-		if err != nil {
-			return fmt.Errorf("erase sector: %w", err)
-		}
-		eraseSectorBytes = n
+	eraseBlocksInBytes, err := parseEraseBlocks(*eraseBlocks)
+	if err != nil {
+		return fmt.Errorf("erase blocks: %w", err)
 	}
-	if eraseSectorBytes == 1 {
-		fmt.Println("Smallest erase sector size: 1 byte.")
-	} else {
-		fmt.Printf("Smallest erase sector size: %d bytes.\n", eraseSectorBytes)
+	if len(eraseBlocksInBytes) == 0 {
+		return fmt.Errorf("at least one erase block size is required")
 	}
+	fmt.Printf("Smallest erase block size: %d byte(s).\n", slices.Min(eraseBlocksInBytes))
 
 	groups, err := parseArgs(os.Args[1:])
 	if err != nil {
