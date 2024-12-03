@@ -96,7 +96,7 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 			i++
 			continue
 		}
-		if matchFlag(args[i], "o", "p2a", "f") && i == len(args)-1 {
+		if matchFlag(args[i], "o", "a", "p2a", "f") && i == len(args)-1 {
 			return nil, fmt.Errorf("no value given for %q", args[i])
 		}
 		switch true {
@@ -113,6 +113,16 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 				Files:     make([]AlignedFile, 0),
 			}
 			currentAlignment = 1
+			i++
+		case matchFlag(args[i], "a"):
+			if wg == nil {
+				return nil, fmt.Errorf("%q has to be preceded by an offset flag (-o)", args[i])
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("cannot parse %q flag value: %s", args[i], args[i+1])
+			}
+			currentAlignment = n
 			i++
 		case matchFlag(args[i], "p2a"):
 			if wg == nil {
@@ -248,7 +258,8 @@ func run() error {
 	debug := flag.Int("debug", 0, "libusb debug level (0..3)")
 	// eraseSector := flag.String("erase-sector", "", "min erase sector size (e.g. 2048, 4K, 1M)")
 	_ = flag.String("o", "", "offset (hex: 0x, octal: 0, binary: 0b or decimal literal)")
-	_ = flag.Int("p2a", 0, "power of two alignment (pad with 0s up to 2^N)")
+	_ = flag.Int("a", 0, "alignment (pad with 0s up to a multiple of N)")
+	_ = flag.Int("p2a", 0, "power of two alignment (pad with 0s up to a multiple of 2^N)")
 	_ = flag.String("f", "", "file to flash")
 	flag.Usage = func() {
 		fmt.Printf("Usage: %s -o <offset> -f <file> [-f <file> ...] [-o <offset> -f <file> ...]\n", os.Args[0])
