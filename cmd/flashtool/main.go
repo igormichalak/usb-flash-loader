@@ -28,6 +28,10 @@ type WriteGroup struct {
 	Files     []AlignedFile
 }
 
+func cmpWriteGroups(a, b WriteGroup) int {
+	return a.MemOffset - b.MemOffset
+}
+
 type FlashChunk struct {
 	MemOffset int
 	MemSize   int
@@ -38,6 +42,10 @@ type FileMapping struct {
 	Path      string
 	MemOffset int
 	MemSize   int
+}
+
+func cmpFileMappings(a, b FileMapping) int {
+	return a.MemOffset - b.MemOffset
 }
 
 func matchFlag(s string, flagNames ...string) bool {
@@ -150,9 +158,6 @@ func parseArgs(args []string) ([]WriteGroup, error) {
 	if wg != nil && len(wg.Files) > 0 {
 		groups = append(groups, *wg)
 	}
-	slices.SortFunc(groups, func(a, b WriteGroup) int {
-		return a.MemOffset - b.MemOffset
-	})
 	return groups, nil
 }
 
@@ -191,7 +196,7 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 	var chunks []FlashChunk
 	var mappings []FileMapping
 	buf := bytes.NewBuffer(make([]byte, 0, 1024))
-	for _, group := range groups {
+	for _, group := range slices.SortedFunc(slices.Values(groups), cmpWriteGroups) {
 		currentMemOffset := group.MemOffset
 		for _, af := range group.Files {
 			pads := (af.Alignment - (currentMemOffset % af.Alignment)) % af.Alignment
@@ -226,9 +231,6 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 			Data:      data,
 		})
 	}
-	slices.SortFunc(mappings, func(a, b FileMapping) int {
-		return a.MemOffset - b.MemOffset
-	})
 	return chunks, mappings, nil
 }
 
@@ -243,7 +245,7 @@ func printFileMappings(mappings []FileMapping) {
 		hexDigits = int(math.Ceil(math.Log2(float64(highestOffset)) / 4))
 	}
 	offsetFormat := fmt.Sprintf("%%#0%dx", hexDigits)
-	for _, mapping := range mappings {
+	for _, mapping := range slices.SortedFunc(slices.Values(mappings), cmpFileMappings) {
 		fmt.Printf(offsetFormat, mapping.MemOffset)
 		fmt.Printf(" <-> %s (%d bytes)\n", mapping.Path, mapping.MemSize)
 	}
