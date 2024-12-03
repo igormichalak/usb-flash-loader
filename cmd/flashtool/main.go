@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/gousb"
@@ -46,6 +47,31 @@ type FileMapping struct {
 
 func cmpFileMappings(a, b FileMapping) int {
 	return a.MemOffset - b.MemOffset
+}
+
+func parseMemSize(s string) (int, error) {
+	multiplier := 1
+	lc, lcn := utf8.DecodeLastRuneInString(s)
+	switch lc {
+	case 'K':
+		multiplier = 1024
+		s = s[:len(s)-lcn]
+	case 'M':
+		multiplier = 1024 * 1024
+		s = s[:len(s)-lcn]
+	default:
+		if !unicode.IsDigit(lc) {
+			return 0, fmt.Errorf("invalid suffix: %q", lc)
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("can't parse mem size: %w", err)
+	}
+	if n > (math.MaxInt / multiplier) {
+		return 0, fmt.Errorf("mem size overflow: %d * %d", n, multiplier)
+	}
+	return n * multiplier, nil
 }
 
 func matchFlag(s string, flagNames ...string) bool {
@@ -246,7 +272,7 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 }
 
 func printFileMappings(mappings []FileMapping) {
-	fmt.Println("File Mappings:")
+	fmt.Println("File mappings:")
 	highestOffset := 0
 	for _, mapping := range mappings {
 		highestOffset = max(highestOffset, mapping.MemOffset)
@@ -273,7 +299,7 @@ func main() {
 
 func run() error {
 	debug := flag.Int("debug", 0, "libusb debug level (0..3)")
-	// eraseSector := flag.String("erase-sector", "", "min erase sector size (e.g. 2048, 4K, 1M)")
+	eraseSector := flag.String("erase-sector", "", "smallest erase sector (e.g. 2048, 4K, 1M)")
 	_ = flag.String("o", "", "offset (hex: 0x, octal: 0, binary: 0b or decimal literal)")
 	_ = flag.Int("a", 0, "alignment (pad with 0s up to a multiple of N)")
 	_ = flag.Int("p2a", 0, "power of two alignment (pad with 0s up to a multiple of 2^N)")
@@ -286,6 +312,20 @@ func run() error {
 
 	if *debug < 0 || *debug > 3 {
 		return fmt.Errorf("debug level out of range (0..3)")
+	}
+
+	eraseSectorBytes := 1
+	if *eraseSector != "" {
+		n, err := parseMemSize(*eraseSector)
+		if err != nil {
+			return fmt.Errorf("erase sector: %w", err)
+		}
+		eraseSectorBytes = n
+	}
+	if eraseSectorBytes == 1 {
+		fmt.Println("Smallest erase sector size: 1 byte.")
+	} else {
+		fmt.Printf("Smallest erase sector size: %d bytes.\n", eraseSectorBytes)
 	}
 
 	groups, err := parseArgs(os.Args[1:])
