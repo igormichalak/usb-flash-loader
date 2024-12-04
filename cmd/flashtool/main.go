@@ -13,11 +13,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/gousb"
 )
+
+const eraseSectorInBytes = 4096
 
 type AlignedFile struct {
 	Alignment int
@@ -27,10 +28,6 @@ type AlignedFile struct {
 type WriteGroup struct {
 	MemOffset int
 	Files     []AlignedFile
-}
-
-func cmpWriteGroups(a, b WriteGroup) int {
-	return a.MemOffset - b.MemOffset
 }
 
 type FlashChunk struct {
@@ -45,46 +42,63 @@ type FileMapping struct {
 	MemSize   int
 }
 
-func cmpFileMappings(a, b FileMapping) int {
-	return a.MemOffset - b.MemOffset
+type EraseRange struct {
+	Address int
+	Sectors int
 }
 
-func parseMemSize(s string) (int, error) {
-	multiplier := 1
-	lc, lcn := utf8.DecodeLastRuneInString(s)
-	switch lc {
-	case 'K':
-		multiplier = 1024
-		s = s[:len(s)-lcn]
-	case 'M':
-		multiplier = 1024 * 1024
-		s = s[:len(s)-lcn]
-	default:
-		if !unicode.IsDigit(lc) {
-			return 0, fmt.Errorf("invalid suffix: %q", lc)
-		}
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("can't parse mem size: %w", err)
-	}
-	if n > (math.MaxInt / multiplier) {
-		return 0, fmt.Errorf("mem size overflow: %d * %d", n, multiplier)
-	}
-	return n * multiplier, nil
+func (r *EraseRange) end() int {
+	return r.Address + r.Sectors*eraseSectorInBytes
 }
 
-func parseEraseBlocks(s string) ([]int, error) {
-	var sizes []int
-	for _, memSize := range strings.Split(s, ",") {
-		n, err := parseMemSize(memSize)
-		if err != nil {
-			return nil, err
-		}
-		sizes = append(sizes, n)
+func log2Int(n int) int {
+	if n <= 0 {
+		return -1
 	}
-	return sizes, nil
+	log := 0
+	for n > 1 {
+		n >>= 1
+		log++
+	}
+	return log
 }
+
+// func parseMemSize(s string) (int, error) {
+// 	multiplier := 1
+// 	lc, lcn := utf8.DecodeLastRuneInString(s)
+// 	switch lc {
+// 	case 'K':
+// 		multiplier = 1024
+// 		s = s[:len(s)-lcn]
+// 	case 'M':
+// 		multiplier = 1024 * 1024
+// 		s = s[:len(s)-lcn]
+// 	default:
+// 		if !unicode.IsDigit(lc) {
+// 			return 0, fmt.Errorf("invalid suffix: %q", lc)
+// 		}
+// 	}
+// 	n, err := strconv.Atoi(s)
+// 	if err != nil {
+// 		return 0, fmt.Errorf("can't parse mem size: %w", err)
+// 	}
+// 	if n > (math.MaxInt / multiplier) {
+// 		return 0, fmt.Errorf("mem size overflow: %d * %d", n, multiplier)
+// 	}
+// 	return n * multiplier, nil
+// }
+
+// func parseEraseBlocks(s string) ([]int, error) {
+// 	var sizes []int
+// 	for _, memSize := range strings.Split(s, ",") {
+// 		n, err := parseMemSize(memSize)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		sizes = append(sizes, n)
+// 	}
+// 	return sizes, nil
+// }
 
 func matchFlag(s string, flagNames ...string) bool {
 	hyphens := 0
@@ -235,17 +249,15 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 	var mappings []FileMapping
 	buf := bytes.NewBuffer(make([]byte, 0, 1024))
 	prevGroupEnd := 0
-	for _, group := range slices.SortedFunc(slices.Values(groups), cmpWriteGroups) {
+	for _, group := range groups {
 		currentMemOffset := group.MemOffset
-
 		if currentMemOffset < prevGroupEnd {
 			return nil, nil, fmt.Errorf(
-				"write group starting at offset %#x overlaps with " +
-				"previous write group ending at %#x",
+				"write group starting at offset %#x overlaps with "+
+					"previous write group ending at %#x",
 				currentMemOffset, prevGroupEnd,
 			)
 		}
-
 		for _, af := range group.Files {
 			pads := (af.Alignment - (currentMemOffset % af.Alignment)) % af.Alignment
 			for i := 0; i < pads; i++ {
@@ -280,7 +292,54 @@ func generateFlashChunks(groups []WriteGroup) ([]FlashChunk, []FileMapping, erro
 		})
 		prevGroupEnd = currentMemOffset
 	}
+	slices.SortFunc(chunks, func(a, b FlashChunk) int {
+		return a.MemOffset - b.MemOffset
+	})
+	slices.SortFunc(mappings, func(a, b FileMapping) int {
+		return a.MemOffset - b.MemOffset
+	})
 	return chunks, mappings, nil
+}
+
+func calculateEraseRanges(chunks []FlashChunk) []EraseRange {
+	var ranges []EraseRange
+	for _, chunk := range chunks {
+		if chunk.MemSize == 0 {
+			continue
+		}
+		startAddress := chunk.MemOffset &^ (eraseSectorInBytes - 1)
+		endAddress := chunk.MemOffset + chunk.MemSize
+		if endAddress%eraseSectorInBytes != 0 {
+			endAddress = (endAddress + eraseSectorInBytes - 1) &^ (eraseSectorInBytes - 1)
+		}
+		sectors := (endAddress - startAddress) >> log2Int(eraseSectorInBytes)
+		ranges = append(ranges, EraseRange{
+			Address: startAddress,
+			Sectors: sectors,
+		})
+	}
+	slices.SortFunc(ranges, func(a, b EraseRange) int {
+		return a.Address - b.Address
+	})
+	return mergeEraseRanges(ranges)
+}
+
+func mergeEraseRanges(ranges []EraseRange) []EraseRange {
+	if len(ranges) == 0 {
+		return nil
+	}
+	var merged []EraseRange
+	current := ranges[0]
+	for _, r := range ranges[1:] {
+		if r.Address <= current.end() {
+			current.Sectors = (r.end() - current.Address) / eraseSectorInBytes
+		} else {
+			merged = append(merged, current)
+			current = r
+		}
+	}
+	merged = append(merged, current)
+	return merged
 }
 
 func printFileMappings(mappings []FileMapping) {
@@ -294,7 +353,7 @@ func printFileMappings(mappings []FileMapping) {
 		hexDigits = int(math.Ceil(math.Log2(float64(highestOffset)) / 4))
 	}
 	offsetFormat := fmt.Sprintf("%%#0%dx", hexDigits)
-	for _, mapping := range slices.SortedFunc(slices.Values(mappings), cmpFileMappings) {
+	for _, mapping := range mappings {
 		fmt.Printf(offsetFormat, mapping.MemOffset)
 		fmt.Printf(" <-> %s (%d bytes)\n", mapping.Path, mapping.MemSize)
 	}
@@ -311,7 +370,7 @@ func main() {
 
 func run() error {
 	debug := flag.Int("debug", 0, "libusb debug level (0..3)")
-	eraseBlocks := flag.String("erase-blocks", "4K,32K,64K", "erase block size list (e.g. 2048,4K,1M)")
+	// eraseBlocks := flag.String("erase-blocks", "4K,32K,64K", "erase block size list (e.g. 2048,4K,1M)")
 	_ = flag.String("o", "", "offset (hex: 0x, octal: 0, binary: 0b or decimal literal)")
 	_ = flag.Int("a", 0, "alignment (pad with 0s up to a multiple of N)")
 	_ = flag.Int("p2a", 0, "power of two alignment (pad with 0s up to a multiple of 2^N)")
@@ -326,14 +385,16 @@ func run() error {
 		return fmt.Errorf("debug level out of range (0..3)")
 	}
 
-	eraseBlocksInBytes, err := parseEraseBlocks(*eraseBlocks)
-	if err != nil {
-		return fmt.Errorf("erase blocks: %w", err)
-	}
-	if len(eraseBlocksInBytes) == 0 {
-		return fmt.Errorf("at least one erase block size is required")
-	}
-	fmt.Printf("Smallest erase block size: %d byte(s).\n", slices.Min(eraseBlocksInBytes))
+	// eraseBlocksInBytes, err := parseEraseBlocks(*eraseBlocks)
+	// if err != nil {
+	// 	return fmt.Errorf("erase blocks: %w", err)
+	// }
+	// if len(eraseBlocksInBytes) == 0 {
+	// 	return fmt.Errorf("at least one erase block size is required")
+	// }
+	// fmt.Printf("Smallest erase block size: %d byte(s).\n", slices.Min(eraseBlocksInBytes))
+
+	fmt.Printf("Erase sector size: %d bytes.\n", eraseSectorInBytes)
 
 	groups, err := parseArgs(os.Args[1:])
 	if err != nil {
@@ -342,7 +403,7 @@ func run() error {
 	if err := verifyFiles(groups); err != nil {
 		return err
 	}
-	_, mappings, err := generateFlashChunks(groups)
+	chunks, mappings, err := generateFlashChunks(groups)
 	if err != nil {
 		return err
 	}
@@ -350,6 +411,8 @@ func run() error {
 	if len(mappings) > 0 {
 		printFileMappings(mappings)
 	}
+
+	_ = calculateEraseRanges(chunks)
 
 	usbctx := gousb.NewContext()
 	defer usbctx.Close()
