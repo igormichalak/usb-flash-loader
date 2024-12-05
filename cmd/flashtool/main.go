@@ -21,6 +21,7 @@ import (
 )
 
 const EraseSectorInBytes = 4096
+
 var EraseSizesDesc = []int{64 * 1024, 32 * 1024, 4 * 1024}
 
 const (
@@ -537,17 +538,31 @@ func padLeft(s string, length int) string {
 	return padding + s
 }
 
-func printErasureSummary(ranges []EraseRange) {
-	m := make(map[int]int, len(EraseSizesDesc))
-	for _, r := range ranges {
-		n := r.Sectors * EraseSectorInBytes
-		for _, size := range EraseSizesDesc {
-			for n-size >= 0 {
-				m[size]++
-				n -= size
+func count64KBlocks(ranges []EraseRange) int {
+	n := 0
+	prevEndAddress := 0
+	for i, r := range ranges {
+		startAddress := r.Address &^ (64*1024 - 1)
+		endAddress := (r.end() + 64*1024 - 1) &^ (64*1024 - 1)
+
+		if i > 0 {
+			if prevEndAddress >= endAddress {
+				continue
+			}
+			if prevEndAddress > startAddress {
+				startAddress = prevEndAddress
 			}
 		}
+
+		n += (endAddress - startAddress) >> log2Int(64*1024)
+		prevEndAddress = endAddress
 	}
+	return n
+}
+
+func printEraseSummary(ranges []EraseRange) {
+	m := make(map[int]int, len(EraseSizesDesc))
+	m[64*1024] = count64KBlocks(ranges)
 	type summaryRow struct {
 		Count string
 		Size  string
@@ -648,7 +663,7 @@ func run() error {
 	}
 	eraseRanges := calculateEraseRanges(chunks)
 	if len(eraseRanges) > 0 {
-		printErasureSummary(eraseRanges)
+		printEraseSummary(eraseRanges)
 	}
 
 	usbctx := gousb.NewContext()
