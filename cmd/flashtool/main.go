@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,12 +14,20 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/gousb"
 )
 
-const eraseSectorInBytes = 4096
+const EraseSectorInBytes = 4096
+var EraseSizesDesc = []int{64 * 1024, 32 * 1024, 4 * 1024}
+
+const (
+	CMD_ERASE_RANGES = 0x01
+	CMD_DATA_SLICE   = 0x02
+	CMD_END_OF_DATA  = 0x03
+)
 
 type AlignedFile struct {
 	Alignment int
@@ -48,7 +57,7 @@ type EraseRange struct {
 }
 
 func (r *EraseRange) end() int {
-	return r.Address + r.Sectors*eraseSectorInBytes
+	return r.Address + r.Sectors*EraseSectorInBytes
 }
 
 func log2Int(n int) int {
@@ -307,12 +316,12 @@ func calculateEraseRanges(chunks []FlashChunk) []EraseRange {
 		if chunk.MemSize == 0 {
 			continue
 		}
-		startAddress := chunk.MemOffset &^ (eraseSectorInBytes - 1)
+		startAddress := chunk.MemOffset &^ (EraseSectorInBytes - 1)
 		endAddress := chunk.MemOffset + chunk.MemSize
-		if endAddress%eraseSectorInBytes != 0 {
-			endAddress = (endAddress + eraseSectorInBytes - 1) &^ (eraseSectorInBytes - 1)
+		if endAddress%EraseSectorInBytes != 0 {
+			endAddress = (endAddress + EraseSectorInBytes - 1) &^ (EraseSectorInBytes - 1)
 		}
-		sectors := (endAddress - startAddress) >> log2Int(eraseSectorInBytes)
+		sectors := (endAddress - startAddress) >> log2Int(EraseSectorInBytes)
 		ranges = append(ranges, EraseRange{
 			Address: startAddress,
 			Sectors: sectors,
@@ -332,7 +341,7 @@ func mergeEraseRanges(ranges []EraseRange) []EraseRange {
 	current := ranges[0]
 	for _, r := range ranges[1:] {
 		if r.Address <= current.end() {
-			current.Sectors = (r.end() - current.Address) / eraseSectorInBytes
+			current.Sectors = (r.end() - current.Address) / EraseSectorInBytes
 		} else {
 			merged = append(merged, current)
 			current = r
@@ -340,6 +349,155 @@ func mergeEraseRanges(ranges []EraseRange) []EraseRange {
 	}
 	merged = append(merged, current)
 	return merged
+}
+
+func transmitEraseRanges(
+	ctx context.Context,
+	epOut *gousb.OutEndpoint,
+	epIn *gousb.InEndpoint,
+	ranges []EraseRange,
+) error {
+	respC := make(chan error)
+	go func() {
+		defer close(respC)
+		buf := make([]byte, epIn.Desc.MaxPacketSize)
+		n, err := epIn.ReadContext(ctx, buf)
+		if err != nil {
+			respC <- fmt.Errorf("failed to read response: %w", err)
+		} else if n != 1 {
+			respC <- fmt.Errorf("invalid response length: %d", n)
+		} else if buf[0] == 0x00 {
+			respC <- nil
+		} else {
+			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
+		}
+	}()
+
+	totalBytes := 5 + len(ranges)*8
+	msg := make([]byte, totalBytes)
+	msg[0] = CMD_ERASE_RANGES
+	binary.BigEndian.PutUint32(msg[1:5], uint32(len(ranges)))
+
+	for i, r := range ranges {
+		pos := 5 + i*8
+		binary.BigEndian.PutUint32(msg[pos:pos+4], uint32(r.Address))
+		binary.BigEndian.PutUint32(msg[pos+4:pos+8], uint32(r.Sectors))
+	}
+
+	if _, err := epOut.WriteContext(ctx, msg); err != nil {
+		return err
+	}
+
+	return <-respC
+}
+
+func transmitChunks(
+	ctx context.Context,
+	epOut *gousb.OutEndpoint,
+	epIn *gousb.InEndpoint,
+	chunks []FlashChunk,
+) error {
+	respC := make(chan error)
+	go func() {
+		defer close(respC)
+		buf := make([]byte, epIn.Desc.MaxPacketSize)
+		n, err := epIn.ReadContext(ctx, buf)
+		if err != nil {
+			respC <- fmt.Errorf("failed to read response: %w", err)
+		} else if n != 1 {
+			respC <- fmt.Errorf("invalid response length: %d", n)
+		} else if buf[0] == 0x00 {
+			respC <- nil
+		} else {
+			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
+		}
+	}()
+
+	PS := epOut.Desc.MaxPacketSize
+	const bufSize = 64 * 1024
+	const headerSize = 7 // cmd (1 byte) + offset (4 bytes) + length (2 bytes)
+
+	queueSize := bufSize / PS
+	stream, err := epOut.NewStream(PS, queueSize)
+	if err != nil {
+		return err
+	}
+
+	buf := make([]byte, bufSize)
+	pos := 0
+
+	for _, chunk := range chunks {
+		offset := 0
+		for offset < chunk.MemSize {
+			dataLen := chunk.MemSize - offset
+			bufAvailable := bufSize - pos
+
+			if headerSize+min(dataLen, 64) > bufAvailable {
+				for i := 0; i < bufAvailable; i++ {
+					buf[pos] = 0x00
+					pos++
+				}
+				_, err := stream.WriteContext(ctx, buf)
+				if err != nil {
+					return err
+				}
+				pos = 0
+				bufAvailable = bufSize
+			}
+
+			if headerSize+dataLen > bufAvailable {
+				dataLen = bufAvailable - headerSize
+			}
+
+			buf[pos] = CMD_DATA_SLICE
+			binary.BigEndian.PutUint32(buf[pos+1:pos+5], uint32(chunk.MemOffset+offset))
+			binary.BigEndian.PutUint16(buf[pos+5:pos+7], uint16(dataLen))
+			pos += headerSize
+			copy(buf[pos:pos+dataLen], chunk.Data[offset:offset+dataLen])
+			pos += dataLen
+			offset += dataLen
+		}
+	}
+
+	finalCmdSent := false
+
+	if pos > 0 {
+		pads := (PS - (pos % PS)) % PS
+		if pads > 0 {
+			buf[pos] = CMD_END_OF_DATA
+			pos++
+			pads--
+			finalCmdSent = true
+		}
+		for i := 0; i < pads; i++ {
+			buf[pos] = 0x00
+			pos++
+		}
+		_, err := stream.WriteContext(ctx, buf[:pos])
+		if err != nil {
+			return err
+		}
+		pos = 0
+	}
+
+	if !finalCmdSent {
+		buf[pos] = CMD_END_OF_DATA
+		pos++
+		for i := 1; i < PS; i++ {
+			buf[pos] = 0x00
+			pos++
+		}
+		_, err := stream.WriteContext(ctx, buf[:PS])
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := stream.CloseContext(ctx); err != nil {
+		return err
+	}
+
+	return <-respC
 }
 
 func printFileMappings(mappings []FileMapping) {
@@ -357,6 +515,86 @@ func printFileMappings(mappings []FileMapping) {
 		fmt.Printf(offsetFormat, mapping.MemOffset)
 		fmt.Printf(" <-> %s (%d bytes)\n", mapping.Path, mapping.MemSize)
 	}
+}
+
+func formatMemSize(n int) string {
+	var postfix string
+	if n%(1024*1024) == 0 {
+		n /= 1024 * 1024
+		postfix = "M"
+	} else if n%1024 == 0 {
+		n /= 1024
+		postfix = "K"
+	}
+	return strconv.Itoa(n) + postfix
+}
+
+func padLeft(s string, length int) string {
+	if len(s) >= length {
+		return s
+	}
+	padding := strings.Repeat(" ", length-len(s))
+	return padding + s
+}
+
+func printErasureSummary(ranges []EraseRange) {
+	m := make(map[int]int, len(EraseSizesDesc))
+	for _, r := range ranges {
+		n := r.Sectors * EraseSectorInBytes
+		for _, size := range EraseSizesDesc {
+			for n-size >= 0 {
+				m[size]++
+				n -= size
+			}
+		}
+	}
+	type summaryRow struct {
+		Count string
+		Size  string
+	}
+	var rows []summaryRow
+	for _, size := range EraseSizesDesc {
+		count, ok := m[size]
+		if !ok {
+			continue
+		}
+		rows = append(rows, summaryRow{
+			Count: strconv.Itoa(count),
+			Size:  formatMemSize(size),
+		})
+	}
+	labelCount := "Block count"
+	labelSize := "Block size"
+	maxLenCount := len(labelCount)
+	maxLenSize := len(labelSize)
+	for _, row := range rows {
+		maxLenCount = max(maxLenCount, len(row.Count))
+		maxLenSize = max(maxLenSize, len(row.Size))
+	}
+	fmt.Println("Erasure summary:")
+	fmt.Printf(
+		" %s | %s \n",
+		padLeft(labelCount, maxLenCount),
+		padLeft(labelSize, maxLenSize),
+	)
+	fmt.Println(strings.Repeat("-", 1+maxLenCount+3+maxLenSize+1))
+	for _, row := range rows {
+		fmt.Printf(
+			" %s | %s \n",
+			padLeft(row.Count, maxLenCount),
+			padLeft(row.Size, maxLenSize),
+		)
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d.Seconds() >= 1 {
+		return fmt.Sprintf("%.2f s", float64(d.Milliseconds())/1e3)
+	}
+	if d.Milliseconds() >= 1 {
+		return fmt.Sprintf("%.2f ms", float64(d.Microseconds())/1e3)
+	}
+	return fmt.Sprintf("%d μs", d.Microseconds())
 }
 
 func main() {
@@ -394,8 +632,6 @@ func run() error {
 	// }
 	// fmt.Printf("Smallest erase block size: %d byte(s).\n", slices.Min(eraseBlocksInBytes))
 
-	fmt.Printf("Erase sector size: %d bytes.\n", eraseSectorInBytes)
-
 	groups, err := parseArgs(os.Args[1:])
 	if err != nil {
 		return err
@@ -407,12 +643,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-
 	if len(mappings) > 0 {
 		printFileMappings(mappings)
 	}
-
-	_ = calculateEraseRanges(chunks)
+	eraseRanges := calculateEraseRanges(chunks)
+	if len(eraseRanges) > 0 {
+		printErasureSummary(eraseRanges)
+	}
 
 	usbctx := gousb.NewContext()
 	defer usbctx.Close()
@@ -440,29 +677,29 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("%s.InEndpoint(0x81): %w", itf, err)
 	}
-	// epOut, err := itf.OutEndpoint(0x01)
-	// if err != nil {
-	// 	return fmt.Errorf("%s.OutEndpoint(0x01): %w", itf, err)
-	// }
+	epOut, err := itf.OutEndpoint(0x01)
+	if err != nil {
+		return fmt.Errorf("%s.OutEndpoint(0x01): %w", itf, err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	respC := make(chan error)
+	fmt.Println("Erasing...")
+	start := time.Now()
+	err = transmitEraseRanges(ctx, epOut, epIn, eraseRanges)
+	if err != nil {
+		return fmt.Errorf("transmitEraseRanges(): %w", err)
+	}
+	fmt.Printf("Success after %s.\n", formatDuration(time.Since(start)))
 
-	go func() {
-		buf := make([]byte, epIn.Desc.MaxPacketSize)
-		n, err := epIn.ReadContext(ctx, buf)
-		if err != nil {
-			respC <- fmt.Errorf("failed to read response: %w", err)
-		} else if n != 1 {
-			respC <- fmt.Errorf("invalid response length: %d", n)
-		} else if buf[0] == 0x00 {
-			respC <- nil
-		} else {
-			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
-		}
-	}()
+	fmt.Println("Writing...")
+	start = time.Now()
+	err = transmitChunks(ctx, epOut, epIn, chunks)
+	if err != nil {
+		return fmt.Errorf("transmitChunks(): %w", err)
+	}
+	fmt.Printf("Success after %s.\n", formatDuration(time.Since(start)))
 
-	return <-respC
+	return nil
 }
