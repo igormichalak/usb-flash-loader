@@ -12,6 +12,10 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 
+#define CMD_ERASE_RANGES	0x01
+#define CMD_DATA_SLICE		0x02
+#define CMD_END_OF_DATA		0x03
+
 #define SPI_SCK_PIN	18
 #define SPI_TX_PIN	19
 #define SPI_RX_PIN	16
@@ -37,9 +41,22 @@
 #define BUFFER_SECTIONS 4
 #define BUFFER_SIZE (BUFFER_SECTION_SIZE * BUFFER_SECTIONS)
 
-static volatile uint8_t __aligned(4) __uninitialized_ram(buffer)[BUFFER_SIZE];
+static volatile uint8_t __aligned(4) __uninitialized_ram(glob_buffer)[BUFFER_SIZE];
 static _Atomic uint32_t __aligned(4) section_locks = 0;
 static _Atomic uint32_t __aligned(4) section_sizes[BUFFER_SECTIONS];
+
+static int write_section = 0;
+static int write_sect_pos = 0;
+static uint8_t *write_ptr = NULL;
+
+static int read_section = 0;
+static int read_sect_pos = 0;
+static uint8_t *read_ptr = NULL;
+
+static absolute_time_t last_reception_time;
+static bool rx_in_progress = false;
+
+void auto_lock_task(void);
 
 void lock_section(int sect) {
 	uint32_t mask = 1U << sect;
@@ -55,6 +72,10 @@ bool is_section_locked(int sect) {
 	uint32_t locks = atomic_load(&section_locks);
 	uint32_t mask = 1U << sect;
 	return (locks & mask) != 0;
+}
+
+static inline bool is_section_unlocked(int sect) {
+	return !is_section_locked(sect);
 }
 
 void set_section_size(int sect, int nbytes) {
@@ -208,6 +229,13 @@ void __not_in_flash_func(flash_aai_write)(spi_inst_t *spi, uint cs_pin, uint rx_
 	flash_wait_done(spi);
 }
 
+static inline uint32_t be_uint32(const uint8_t *src) {
+	return ((uint32_t) src[0] << 24) |
+		   ((uint32_t) src[1] << 16) |
+		   ((uint32_t) src[2] << 8)  |
+		   ((uint32_t) src[3]);
+}
+
 void core1_entry() {
 	gpio_set_dir(SPI_CSN_PIN, GPIO_OUT);
 	gpio_put(SPI_CSN_PIN, 0);
@@ -221,7 +249,58 @@ void core1_entry() {
 
 	flash_unlock(spi0);
 
-	while (true) {}
+	while (true) {
+		if (is_section_unlocked(read_section)) {
+			int sect = read_section;
+			while (is_section_unlocked(sect)) {
+				sect = (sect + 1) % BUFFER_SECTIONS;
+				sleep_ms(1);
+			}
+			read_section = sect;
+			read_sect_pos = 0;
+			read_ptr = NULL;
+		}
+
+		if (read_ptr == NULL) {
+			read_ptr = glob_buffer + (read_section * BUFFER_SECTION_SIZE) + read_sect_pos;
+		}
+
+		int remaining = get_section_size(read_section) - read_sect_pos;
+
+		while (remaining > 0) {
+			switch (*read_ptr) {
+			case CMD_ERASE_RANGES:
+				--remaining;
+				++read_sect_pos;
+				++read_ptr;
+				if (remaining < 4) break;
+				uint32_t count = be_uint32(read_ptr);
+				int body_size = 8 * count;
+				remaining -= 4;
+				read_sect_pos += 4;
+				read_ptr += 4;
+				if (remaining < body_size) break;
+				for (int i = 0; i < count; ++i) {
+					uint32_t address = be_uint32(read_ptr);
+					uint32_t sectors = be_uint32(read_ptr+4);
+					read_ptr += 8;
+				}
+				remaining -= body_size;
+				read_sect_pos += body_size;
+				break;
+			default:
+				--remaining;
+				++read_sect_pos;
+				++read_ptr;
+				break;
+			}
+		}
+
+		unlock_section(read_section);
+
+		read_sect_pos = 0;
+		read_ptr = NULL;
+	}
 }
 
 int main(void) {
@@ -244,6 +323,23 @@ int main(void) {
 
 	while (true) {
 		tud_task();
+		auto_lock_task();
+	}
+}
+
+void auto_lock_task(void) {
+	if (rx_in_progress) return;
+	if (is_nil_time(last_reception_time)) return;
+
+	if (is_section_locked(write_section)) return;
+	if (write_sect_pos == 0) return;
+
+	if (absolute_time_diff_us(last_reception_time, get_absolute_time()) > 1e5) {
+		set_section_size(write_section, write_sect_pos);
+		lock_section(write_section);
+
+		write_sect_pos = 0;
+		write_ptr = NULL;
 	}
 }
 
@@ -258,12 +354,46 @@ void tud_resume_cb(void) {}
 void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize) {
 	(void) itf;
 
-	for (size_t i = 0; i < bufsize; ++i) {
-		printf("%c", *buffer++);
+	rx_in_progress = true;
+	int remaining = (int) bufsize;
+
+	while (remaining > 0) {
+		if (is_section_locked(write_section)) {
+			int sect = write_section;
+			while (is_section_locked(sect)) {
+				sect = (sect + 1) % BUFFER_SECTIONS;
+				sleep_ms(1);
+			}
+			write_section = sect;
+			write_sect_pos = 0;
+			write_ptr = NULL;
+		}
+
+		if (write_ptr == NULL) {
+			write_ptr = glob_buffer + (write_section * BUFFER_SECTION_SIZE) + write_sect_pos;
+		}
+
+		int sect_remaining = BUFFER_SECTION_SIZE - write_sect_pos;
+		if (sect_remaining > 0) {
+			int cpy_size = (remaining < sect_remaining) ? remaining : sect_remaining;
+			memcpy(write_ptr, buffer, cpy_size);
+			buffer += cpy_size;
+			remaining -= cpy_size;
+			write_sect_pos += cpy_size;
+			write_ptr += cpy_size;
+		} else {
+			set_section_size(write_section, BUFFER_SECTION_SIZE);
+			lock_section(write_section);
+
+			write_sect_pos = 0;
+			write_ptr = NULL;
+		}
 	}
-	printf("\n");
 
 #if CFG_TUD_VENDOR_RX_BUFSIZE > 0
 	tud_vendor_read_flush();
 #endif
+
+	last_reception_time = get_absolute_time();
+	rx_in_progress = false;
 }
