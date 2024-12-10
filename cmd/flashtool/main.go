@@ -25,9 +25,11 @@ const EraseSectorInBytes = 4096
 var EraseSizesDesc = []int{64 * 1024, 32 * 1024, 4 * 1024}
 
 const (
-	CMD_ERASE_RANGES = 0x01
-	CMD_DATA_SLICE   = 0x02
-	CMD_END_OF_DATA  = 0x03
+	CMD_ERASE_RANGES      = 0x87
+	CMD_DATA_SLICE        = 0x66
+	CMD_END_OF_DATA       = 0xBA
+	RESP_SUCCESS          = 0x72
+	RESP_ERR_VERIFICATION = 0xC4
 )
 
 type AlignedFile struct {
@@ -367,7 +369,7 @@ func transmitEraseRanges(
 			respC <- fmt.Errorf("failed to read response: %w", err)
 		} else if n != 1 {
 			respC <- fmt.Errorf("invalid response length: %d", n)
-		} else if buf[0] == 0x00 {
+		} else if buf[0] == RESP_SUCCESS {
 			respC <- nil
 		} else {
 			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
@@ -407,8 +409,10 @@ func transmitChunks(
 			respC <- fmt.Errorf("failed to read response: %w", err)
 		} else if n != 1 {
 			respC <- fmt.Errorf("invalid response length: %d", n)
-		} else if buf[0] == 0x00 {
+		} else if buf[0] == RESP_SUCCESS {
 			respC <- nil
+		} else if buf[0] == RESP_ERR_VERIFICATION {
+			respC <- fmt.Errorf("data verification failed (%#02x)", buf[0])
 		} else {
 			respC <- fmt.Errorf("unrecognized error (%#02x)", buf[0])
 		}

@@ -12,9 +12,14 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 
-#define CMD_ERASE_RANGES	0x01
-#define CMD_DATA_SLICE		0x02
-#define CMD_END_OF_DATA		0x03
+#define DEBUG false
+
+#define CMD_ERASE_RANGES	0x87
+#define CMD_DATA_SLICE		0x66
+#define CMD_END_OF_DATA		0xBA
+
+#define RESP_SUCCESS			0x72
+#define RESP_ERR_VERIFICATION	0xC4
 
 #define SPI_SCK_PIN	18
 #define SPI_TX_PIN	19
@@ -37,9 +42,16 @@
 
 #define FLASH_STATUS_BUSY_MASK 0x01
 
+#define FLASH_ERASE_SECTOR_SIZE 4096
+
 #define BUFFER_SECTION_SIZE (64 * 1024)
 #define BUFFER_SECTIONS 4
 #define BUFFER_SIZE (BUFFER_SECTION_SIZE * BUFFER_SECTIONS)
+
+typedef struct {
+	uint32_t address;
+	int sectors;		// Number of 4K sectors
+} erase_range_t;
 
 static volatile uint8_t __aligned(4) __uninitialized_ram(glob_buffer)[BUFFER_SIZE];
 static _Atomic uint32_t __aligned(4) section_locks = 0;
@@ -58,14 +70,26 @@ static bool rx_in_progress = false;
 
 void auto_lock_task(void);
 
+uint32_t read_locks(void) {
+	uint32_t locks = atomic_load(&section_locks);
+	uint32_t mask = (1 << BUFFER_SECTIONS) - 1;
+	return locks & mask;
+}
+
 void lock_section(int sect) {
 	uint32_t mask = 1U << sect;
 	atomic_fetch_or(&section_locks, mask);
+	if (DEBUG) {
+		printf("locked s%d\n", sect);
+	}
 }
 
 void unlock_section(int sect) {
 	uint32_t mask = ~(1U << sect);
 	atomic_fetch_and(&section_locks, mask);
+	if (DEBUG) {
+		printf("unlocked s%d\n", sect);
+	}
 }
 
 bool is_section_locked(int sect) {
@@ -80,6 +104,9 @@ static inline bool is_section_unlocked(int sect) {
 
 void set_section_size(int sect, int nbytes) {
 	atomic_store(&section_sizes[sect], (uint32_t) nbytes);
+	if (DEBUG) {
+		printf("new s%d size: %d bytes\n", sect, nbytes);
+	}
 }
 
 int get_section_size(int sect) {
@@ -164,6 +191,64 @@ void __not_in_flash_func(flash_read)(spi_inst_t *spi, uint cs_pin, uint32_t addr
 	gpio_set_function(cs_pin, GPIO_FUNC_SPI);
 }
 
+bool __not_in_flash_func(flash_verify)(spi_inst_t *spi, uint cs_pin, uint32_t addr, const uint8_t *src, size_t len) {
+	bool valid = true;
+
+	uint8_t cmdbuf[4] = {
+		FLASH_CMD_READ,
+		addr >> 16,
+		addr >> 8,
+		addr,
+	};
+
+	const size_t fifo_depth = 8;
+	const uint8_t repeated_tx_data = 0;
+	size_t tx_cmd_remaining = 4;
+	size_t tx_data_remaining = len;
+	size_t rx_cmd_remaining = 4;
+	size_t rx_data_remaining = len;
+
+	gpio_set_function(cs_pin, GPIO_FUNC_SIO);
+	asm volatile("nop \n nop \n nop");
+
+	while (tx_cmd_remaining || tx_data_remaining || rx_cmd_remaining || rx_data_remaining) {
+		size_t tx_remaining = tx_cmd_remaining + tx_data_remaining;
+		size_t rx_remaining = rx_cmd_remaining + rx_data_remaining;
+		if (spi_is_writable(spi) && rx_remaining < tx_remaining + fifo_depth) {
+			if (tx_cmd_remaining) {
+				spi_get_hw(spi)->dr = (uint32_t) cmdbuf[4 - tx_cmd_remaining];
+				--tx_cmd_remaining;
+			} else if (tx_data_remaining) {
+				spi_get_hw(spi)->dr = (uint32_t) repeated_tx_data;
+				--tx_data_remaining;
+			}
+		}
+		if (spi_is_readable(spi)) {
+			if (rx_cmd_remaining) {
+				(void) spi_get_hw(spi)->dr;
+				--rx_cmd_remaining;
+			} else if (rx_data_remaining) {
+				uint8_t data = (uint8_t) spi_get_hw(spi)->dr;
+				uint8_t want = *src++;
+				if (valid && data != want) {
+					valid = false;
+					if (DEBUG) {
+						printf("mismatch at position %d\n", len - rx_data_remaining);
+						printf("want 0x%02" PRIx8 "; got 0x%02" PRIx8 "\n", want, data);
+					}
+				}
+				--rx_data_remaining;
+			}
+		}
+	}
+
+	while (spi_get_hw(spi)->sr & SPI_SSPSR_BSY_BITS);
+	asm volatile("nop \n nop \n nop");
+	gpio_set_function(cs_pin, GPIO_FUNC_SPI);
+
+	return valid;
+}
+
 void __not_in_flash_func(flash_erase)(spi_inst_t *spi, uint8_t erase_cmd, uint32_t addr) {
 	uint8_t cmdbuf[4] = {
 		erase_cmd,
@@ -189,7 +274,7 @@ void __not_in_flash_func(flash_byte_write)(spi_inst_t *spi, uint32_t addr, uint8
 	flash_wait_done(spi);
 }
 
-void __not_in_flash_func(flash_aai_write)(spi_inst_t *spi, uint cs_pin, uint rx_pin, uint32_t addr, uint8_t *src, size_t len) {
+void __not_in_flash_func(flash_aai_write)(spi_inst_t *spi, uint cs_pin, uint rx_pin, uint32_t addr, const uint8_t *src, size_t len) {
 	uint8_t ebsy_cmd = FLASH_CMD_HW_BUSY_ENABLE;
 	spi_write_blocking(spi, &ebsy_cmd, 1);
 
@@ -236,23 +321,129 @@ static inline uint32_t be_uint32(const uint8_t *src) {
 		   ((uint32_t) src[3]);
 }
 
+static inline uint16_t be_uint16(const uint8_t *src) {
+	return ((uint32_t) src[0] << 8) |
+		   ((uint32_t) src[1]);
+}
+
+void erase_ranges_blocking(spi_inst_t *spi, const erase_range_t *ranges, int range_count) {
+	const uint32_t block_mask = 64 * 1024 - 1;
+	uint32_t prev_end_addr = 0;
+
+	for (int i = 0; i < range_count; ++i) {
+		uint32_t start_addr = ranges[i].address & ~block_mask;
+		uint32_t end_addr = ranges[i].address +
+							ranges[i].sectors * FLASH_ERASE_SECTOR_SIZE;
+		end_addr = (end_addr + block_mask) & ~block_mask;
+
+		if (i > 0) {
+			if (prev_end_addr >= end_addr) {
+				continue;
+			}
+			if (prev_end_addr > start_addr) {
+				start_addr = prev_end_addr;
+			}
+		}
+
+		uint32_t block_addr = start_addr;
+		while (block_addr < end_addr) {
+			flash_erase(spi, FLASH_CMD_ERASE_64K_BLOCK, block_addr);
+			if (DEBUG) {
+				printf("64K erase at address: 0x%08" PRIx32 "\n", block_addr);
+			}
+			block_addr += 64 * 1024;
+		}
+
+		prev_end_addr = end_addr;
+	}
+}
+
+int write_and_verify_blocking(spi_inst_t *spi, uint cs_pin, uint rx_pin, uint32_t addr, const uint8_t *src, size_t len) {
+	int written = 0;
+
+	if (DEBUG) {
+		printf("writing %d bytes at address 0x%08" PRIx32 "\n", len, addr);
+	}
+
+	bool odd_addr = addr % 2 == 1;
+	if (odd_addr) {
+		flash_byte_write(spi0, addr, *src);
+		if (DEBUG) {
+			printf("wrote 0x%02" PRIx8 " at odd address 0x%08" PRIx32 "\n", *src, addr);
+		}
+		++addr;
+		++src;
+		++written;
+	}
+	if (written == len) return written;
+
+	size_t aai_write_size = len - written;
+
+	bool trailing_byte = aai_write_size % 2 == 1;
+	if (trailing_byte) {
+		--aai_write_size;
+	}
+
+	if (aai_write_size > 0) {
+		flash_aai_write(
+			spi0,
+			SPI_CSN_PIN, SPI_RX_PIN,
+			addr,
+			src,
+			aai_write_size
+		);
+		addr += aai_write_size;
+		src += aai_write_size;
+		written += aai_write_size;
+	}
+
+	if (trailing_byte) {
+		flash_byte_write(spi0, addr, *src);
+		if (DEBUG) {
+			printf("wrote trailing byte 0x%02" PRIx8 " at address 0x%08" PRIx32 "\n", *src, addr);
+		}
+		++written;
+	}
+	if (DEBUG) {
+		printf("wrote %d bytes\n", written);
+	}
+	return written;
+}
+
 void core1_entry() {
 	gpio_set_dir(SPI_CSN_PIN, GPIO_OUT);
 	gpio_put(SPI_CSN_PIN, 0);
 
-	spi_init(spi0, 1000 * 1000);
+	spi_init(spi0, 10 * 1000 * 1000);
 	spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
 	gpio_set_function(SPI_SCK_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_TX_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_RX_PIN, GPIO_FUNC_SPI);
 	gpio_set_function(SPI_CSN_PIN, GPIO_FUNC_SPI);
 
+	sleep_ms(1);
 	flash_unlock(spi0);
+
+	bool got_eod = false;
+	uint8_t got_err = 0x00;
 
 	while (true) {
 		if (is_section_unlocked(read_section)) {
 			int sect = read_section;
 			while (is_section_unlocked(sect)) {
+				if (got_eod && read_locks() == 0) {
+					if (tud_vendor_write_available()) {
+						uint8_t resp = got_err ? got_err : RESP_SUCCESS;
+						tud_vendor_write(&resp, 1);
+						tud_vendor_write_flush();
+						if (DEBUG) {
+							printf("sent response: 0x%02" PRIx8 "\n", resp);
+							printf("-----------------------------\n");
+						}
+						got_eod = false;
+						got_err = 0x00;
+					}
+				}
 				sect = (sect + 1) % BUFFER_SECTIONS;
 				sleep_ms(1);
 			}
@@ -274,19 +465,86 @@ void core1_entry() {
 				++read_sect_pos;
 				++read_ptr;
 				if (remaining < 4) break;
-				uint32_t count = be_uint32(read_ptr);
-				int body_size = 8 * count;
+				int range_count = (int) be_uint32(read_ptr);
+				int body_size = 8 * range_count;
 				remaining -= 4;
 				read_sect_pos += 4;
 				read_ptr += 4;
 				if (remaining < body_size) break;
-				for (int i = 0; i < count; ++i) {
-					uint32_t address = be_uint32(read_ptr);
-					uint32_t sectors = be_uint32(read_ptr+4);
+				erase_range_t *ranges = malloc(range_count * sizeof(erase_range_t));
+				if (ranges == NULL) {
+					if (DEBUG) {
+						printf(
+							"can't allocate %d ranges (%d bytes)\n",
+							range_count,
+							range_count * sizeof(erase_range_t)
+						);
+					}
+					break;
+				};
+				for (int i = 0; i < range_count; ++i) {
+					ranges[i].address = be_uint32(read_ptr);
+					ranges[i].sectors = (int) be_uint32(read_ptr+4);
 					read_ptr += 8;
 				}
+				erase_ranges_blocking(spi0, ranges, range_count);
+				free(ranges);
 				remaining -= body_size;
 				read_sect_pos += body_size;
+				while (!tud_vendor_write_available());
+				uint8_t resp = RESP_SUCCESS;
+				tud_vendor_write(&resp, 1);
+				tud_vendor_write_flush();
+				break;
+			case CMD_DATA_SLICE:
+				--remaining;
+				++read_sect_pos;
+				++read_ptr;
+				if (DEBUG) {
+					printf("started processing a data slice from s%d\n", read_section);
+				}
+				if (remaining < 6) break;
+				uint32_t target_addr = be_uint32(read_ptr);
+				int data_size = (int) be_uint16(read_ptr+4);
+				remaining -= 6;
+				read_sect_pos += 6;
+				read_ptr += 6;
+				if (remaining < data_size) {
+					if (DEBUG) printf("remaining < data_size !!!\n");
+					break;
+				};
+				write_and_verify_blocking(
+					spi0,
+					SPI_CSN_PIN, SPI_RX_PIN,
+					target_addr,
+					read_ptr,
+					data_size
+				);
+				if (DEBUG) {
+					printf("wrote complete, starting verification...\n");
+				}
+				bool valid = flash_verify(
+					spi0,
+					SPI_CSN_PIN,
+					target_addr,
+					read_ptr,
+					data_size
+				);
+				if (got_err == 0x00 && !valid) {
+					got_err = RESP_ERR_VERIFICATION;
+				}
+				if (DEBUG) {
+					printf("64K verification: %s\n", valid ? "success" : "failure");
+				}
+				remaining -= data_size;
+				read_sect_pos += data_size;
+				read_ptr += data_size;
+				break;
+			case CMD_END_OF_DATA:
+				--remaining;
+				++read_sect_pos;
+				++read_ptr;
+				got_eod = true;
 				break;
 			default:
 				--remaining;
@@ -334,7 +592,7 @@ void auto_lock_task(void) {
 	if (is_section_locked(write_section)) return;
 	if (write_sect_pos == 0) return;
 
-	if (absolute_time_diff_us(last_reception_time, get_absolute_time()) > 1e5) {
+	if (absolute_time_diff_us(last_reception_time, get_absolute_time()) > 5e5) {
 		set_section_size(write_section, write_sect_pos);
 		lock_section(write_section);
 
