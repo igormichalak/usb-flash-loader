@@ -12,7 +12,7 @@ For synchronization, each buffer has an atomic lock, along with information abou
 
 The first core receives a stream of commands and data via USB and fills the unlocked buffers with them, then locking them.
 
-The second cores takes the locked buffers and executes the commands it finds inside, including erase and flash commands. It does this by sending flash-specific commands over the SPI protocol in a continous mode (Auto Address Increment Programming, AAI for short).
+The second cores takes the locked buffers and executes the commands it finds inside, including erase and flash commands. It does this by sending flash-specific commands over the SPI protocol in a continous mode (Auto Address Increment Programming, AAI for short). And unlocks them afterwards.
 
 ## The CLI flashtool
 
